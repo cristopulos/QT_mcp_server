@@ -20,10 +20,13 @@ This guide covers local setup, manual protocol checks, tool additions, platform 
 │   └── qt-editor.mcp-config.example.json
 ├── src/
 │   └── qt_mcp/
-│       ├── __init__.py       # package version
+│       ├── __init__.py       # package version and guarded exports
+│       ├── agent.py          # Qt-side QLocalSocket agent and widget capture
+│       ├── agent_proxy.py    # server-side asyncio Unix socket proxy
 │       ├── filesystem.py     # filesystem implementation
+│       ├── protocol.py       # newline-delimited JSON frames and socket path
 │       ├── screenshots.py    # platform discovery and PNG capture
-│       └── server.py         # standalone 13-tool FastMCP server
+│       └── server.py         # standalone 15-tool FastMCP server
 ├── tests/
 ├── .gitignore
 ├── mcp-config.example.json
@@ -89,7 +92,7 @@ The `examples` directory must be importable. From the repository root, set `PYTH
 PYTHONPATH=examples .venv/bin/python -m qt_editor.main
 ```
 
-The normal command starts a visible editor and the embedded MCP server. Since stdio belongs to MCP, an MCP client should normally launch it using [`examples/qt-editor.mcp-config.example.json`](../examples/qt-editor.mcp-config.example.json).
+The normal command starts a visible editor and its unchanged 14-tool embedded MCP server. Since stdio belongs to MCP, an MCP client should normally launch it using [`examples/qt-editor.mcp-config.example.json`](../examples/qt-editor.mcp-config.example.json).
 
 For a window-only visual check, disable MCP:
 
@@ -104,6 +107,58 @@ $env:PYTHONPATH = "examples"
 $env:QT_EDITOR_NO_MCP = "1"
 .venv\Scripts\python.exe -m qt_editor.main
 ```
+
+### Run the example as a proxy agent
+
+Agent mode runs the Qt app normally and connects it to a separately launched standalone server. Start the example with either form:
+
+```bash
+PYTHONPATH=examples .venv/bin/python -m qt_editor.main --agent
+```
+
+```bash
+QT_EDITOR_AGENT=1 PYTHONPATH=examples .venv/bin/python -m qt_editor.main
+```
+
+In another process, launch or drive the standalone server through an MCP client or the stdio driver below. The first call to `attach_status`, `list_capturable_widgets`, or `capture_widget` lazily starts the proxy listener at `/tmp/qt-mcp-<uid>.sock`. Poll `attach_status` until it reports an attachment:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": {
+    "name": "attach_status",
+    "arguments": {}
+  }
+}
+```
+
+Expected state transitions:
+
+```json
+{"attached": false, "socket_path": "/tmp/qt-mcp-1000.sock"}
+```
+
+```json
+{"attached": true, "socket_path": "/tmp/qt-mcp-1000.sock"}
+```
+
+Then call `list_capturable_widgets` and `capture_widget`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "method": "tools/call",
+  "params": {
+    "name": "capture_widget",
+    "arguments": {"widget_name": "editor_area"}
+  }
+}
+```
+
+The standalone proxy is Linux-only in v1 and accepts one attached app per socket. Windows named-pipe support is not implemented. The agent's `QLocalSocket` and `readyRead` handler must remain on the Qt main thread so `QWidget.grab()` is safe.
 
 ## Manually test MCP over stdio
 
@@ -209,7 +264,8 @@ Keep reusable behavior outside `server.py`:
 
 - Screenshot and window behavior belongs in `screenshots.py` and raises `CaptureError`.
 - Filesystem behavior belongs in `filesystem.py` and raises `FilesystemError`.
-- Application-specific GUI behavior belongs behind the in-process bridge.
+- Application-specific GUI behavior belongs behind the in-process bridge or in `agent.py`.
+- Proxy lifecycle and request correlation belong in `agent_proxy.py`; shared wire-format changes belong in `protocol.py`.
 
 ### 2. Add a typed FastMCP wrapper
 
@@ -242,7 +298,7 @@ Use `ToolError` for expected caller-facing failures. Preserve the original excep
 
 ### 3. Register it in each applicable server
 
-The standalone server and in-process example use separate `FastMCP` instances. Add a shared tool to both if both modes should expose it. Do not register a duplicate name on an existing instance; FastMCP raises on duplicate tool registration.
+The standalone server and in-process example use separate `FastMCP` instances. Add a shared tool to both only if both modes should expose it; proxy-only tools remain in standalone `server.py` and may require matching protocol and agent handlers. Do not register a duplicate name on an existing instance; FastMCP raises on duplicate tool registration.
 
 ### 4. Update contracts and tests
 
@@ -272,6 +328,16 @@ sudo apt install wmctrl x11-utils
 - Window discovery uses stdlib `ctypes`; do not add `pywin32` unless the architecture changes and there is a demonstrated need.
 - Test display scaling, multiple monitors, negative virtual-screen coordinates, minimized windows, and non-ASCII titles.
 - No macOS compatibility should be inferred from the Windows implementation. The Windows path has not been tested on macOS, and `sys.platform` dispatch will not select it there.
+
+### Proxy/agent capture
+
+- Proxy mode is Linux-only in v1; the default socket is `/tmp/qt-mcp-<uid>.sock`.
+- Verify that `attach_status` changes from false to true when the agent connects and back to false after disconnection.
+- Confirm a second app is rejected while one app is attached to the socket.
+- Start the app before and after the proxy listener to exercise the `QTimer` reconnect path.
+- Confirm `list_capturable_widgets` includes all descendant widgets with non-empty `objectName()` values, including named Qt internals.
+- Block the GUI thread and verify the 10-second proxy operation timeout becomes a controlled tool error.
+- Import `qt_mcp` in an environment without importing PySide6; explicit agent use is the point where PySide6 is needed.
 
 ### In-process Qt capture
 

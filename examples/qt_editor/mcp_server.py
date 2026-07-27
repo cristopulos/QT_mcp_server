@@ -1,5 +1,10 @@
 """In-process MCP server for the example Qt editor.
 
+NOTE: In ``--agent`` mode (``QT_EDITOR_AGENT=1``), this module's
+``build_server()`` is NOT used — the standalone ``qt-mcp`` server proxies
+capture requests over a Unix domain socket instead.  This file is only used
+in the default in-process mode.
+
 This module owns the concurrency design that lets the MCP stdio server
 (in a background thread) call into the Qt GUI thread to capture a specific
 widget by name.

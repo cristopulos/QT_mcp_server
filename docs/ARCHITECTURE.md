@@ -1,23 +1,32 @@
 # Architecture
 
-`qt-mcp` exposes desktop screenshots and filesystem operations through the Model Context Protocol. It supports an external standalone process and an embedded Qt application process while keeping the same stdio-facing tool model.
+`qt-mcp` exposes desktop screenshots and filesystem operations through the Model Context Protocol. It supports OS-level standalone capture, standalone proxy/agent capture, and an embedded Qt application server while keeping a stdio-facing MCP tool model.
 
 ## High-level topology
 
 ```text
-                                  one of two server process forms
+                              supported process topologies
 
-AI client  <--- stdio JSON-RPC --->  standalone qt_mcp.server
-                                      ├── OS window enumeration
-                                      ├── screen capture
-                                      └── filesystem operations
+OS-level standalone:
+AI client <--- stdio JSON-RPC ---> qt_mcp.server
+                                    ├── OS window enumeration and screen capture
+                                    └── filesystem operations
 
-AI client  <--- stdio JSON-RPC --->  in-process Qt application
-                                      ├── background FastMCP server
-                                      ├── main-thread QApplication
-                                      ├── QWidget capture bridge
-                                      ├── OS window/screen capture
-                                      └── filesystem operations
+Proxy/agent:
+AI client <--- stdio JSON-RPC ---> qt_mcp.server
+                                    ├── filesystem and OS capture tools
+                                    └── background asyncio AgentProxy
+                                                   |
+                                      Unix domain socket, NDJSON
+                                                   |
+                                    Qt app Agent (QLocalSocket)
+                                    └── main-thread QWidget.grab()
+
+In-process:
+AI client <--- stdio JSON-RPC ---> Qt application process
+                                    ├── background FastMCP server
+                                    ├── main-thread QApplication
+                                    └── CaptureBridge + QWidget.grab()
 ```
 
 The MCP client starts the configured command and owns its stdin and stdout. Requests and responses flow as JSON-RPC over those streams. Screenshots are returned as MCP image content containing base64-encoded PNG data.
@@ -27,17 +36,23 @@ The MCP client starts the configured command and owns its stdin and stdout. Requ
 ```text
 src/qt_mcp/
 ├── __init__.py
-├── server.py
+├── agent.py
+├── agent_proxy.py
+├── filesystem.py
+├── protocol.py
 ├── screenshots.py
-└── filesystem.py
+└── server.py
 ```
 
 | Module | Responsibility |
 |---|---|
-| `__init__.py` | Package metadata, including the package version. |
-| `server.py` | Creates the standalone `FastMCP` instance, registers 13 tool wrappers, converts domain errors to `ToolError`, and starts stdio transport. |
-| `screenshots.py` | Dispatches window discovery by platform, matches titles, captures pixel rectangles, encodes PNG data, and defines `CaptureError`. Its standalone widget function is intentionally a stub. |
+| `__init__.py` | Package version and exports. It exports `AgentProxy` and `AgentError` without Qt and guards agent exports so importing `qt_mcp` does not hard-require PySide6. |
+| `server.py` | Creates the standalone `FastMCP` instance, registers 15 tool wrappers, converts domain errors to `ToolError`, starts stdio transport, and lazily owns the proxy singleton and background loop. |
+| `screenshots.py` | Dispatches OS window discovery, matches titles, captures pixel rectangles, encodes PNG data, and defines `CaptureError`. |
 | `filesystem.py` | Resolves paths and implements text reads/writes, directory operations, metadata, glob search, regex content search, and `FilesystemError`. |
+| `protocol.py` | Defines the newline-delimited JSON request/response format, Linux default socket path, `ProtocolError`, and synchronous/asynchronous frame helpers. |
+| `agent_proxy.py` | Implements the server-side asyncio Unix socket `AgentProxy`, single-app enforcement, request correlation, attachment state, timeouts, and `AgentError`. |
+| `agent.py` | Implements the Qt-side `Agent` with lazy PySide6 imports, `QLocalSocket` request handling, GUI-thread widget capture, and `QTimer` reconnect behavior. |
 
 The server layer is deliberately thin. Platform and filesystem behavior lives in ordinary Python functions, making those functions reusable by the embedded example without importing the standalone `FastMCP` instance.
 
@@ -90,6 +105,43 @@ Window title matching is case-insensitive substring matching by default. Ambiguo
 
 `capture_region` either uses absolute screen coordinates or resolves a window and adds the requested offsets to its top-left coordinate. In both cases, the final operation is an OS-level screen grab; it records what is visible at those pixels.
 
+## Proxy/agent concurrency and protocol
+
+The standalone proxy preserves process separation while moving widget rendering into the Qt process that owns the widgets.
+
+```text
+Standalone server                     Qt application main thread
+-----------------                     --------------------------
+MCP process starts
+attach_status/list/capture called
+    |
+    +-- lazily start daemon asyncio loop
+    +-- bind /tmp/qt-mcp-<uid>.sock
+    |                                      application launches
+    |                                      start_agent(window)
+    |<======== QLocalSocket connects ======|
+    |   is_attached = true                 |
+    |                                      |
+MCP client calls capture_widget             |
+    |                                      |
+    +-- send NDJSON request frame =========>|
+    |                                      | readyRead fires
+    |                                      | findChild(QWidget, name)
+    |                                      | QWidget.grab()
+    |                                      | QPixmap -> QBuffer -> PNG
+    |                                      | base64 encode
+    |<======= NDJSON response frame ========|
+    |
+    +-- base64 decode
+    `-- return FastMCP Image to client
+```
+
+`server.py` creates the `AgentProxy` singleton lazily on the first proxy-tool call. The proxy runs in a daemon thread with its own asyncio event loop and uses `asyncio.start_unix_server`. It accepts one attached application at a time, correlates request IDs with pending futures, and applies a 10-second operation timeout.
+
+The Qt-side `Agent` creates `QLocalSocket` on the GUI thread. Because `readyRead` is delivered to the socket's owning thread, request dispatch and `QWidget.grab()` both run on the Qt main thread. Capture responses contain base64 PNG data plus width, height, and format fields; the MCP layer converts the PNG back into `Image` content.
+
+If the server is unavailable or disconnects, the agent uses single-shot `QTimer` callbacks for non-blocking reconnect attempts with backoff, resetting the retry state after a successful connection. The default socket is `/tmp/qt-mcp-<uid>.sock` on Linux. Windows named-pipe support is not implemented in v1.
+
 ## In-process concurrency model
 
 The example app in `examples/qt_editor/` adds exact widget capture without violating Qt's thread affinity rules.
@@ -127,7 +179,7 @@ OS capture copies desktop pixels. It cannot recover a widget hidden by another w
 
 `QWidget.grab()` renders the selected Qt widget to a `QPixmap` on the GUI thread. The capture is naturally bounded to that object and remains usable when the widget is occluded or off-screen. A stable `objectName` therefore becomes a precise application-level capture identifier.
 
-The standalone process cannot call `QWidget.grab()` because it has no access to the target process's QObject tree. Its `capture_widget` is a stub that returns guidance to use `capture_region`. The embedded app owns its widgets and can provide the real implementation.
+The standalone process cannot call `QWidget.grab()` directly because it has no access to another process's QObject tree. In proxy mode, the attached agent performs the call inside the target Qt process and returns PNG data over the socket. In-process mode performs the same GUI-thread operation through `CaptureBridge` without a socket.
 
 ## Dependencies
 
@@ -138,13 +190,13 @@ The standalone process cannot call `QWidget.grab()` because it has no access to 
 | `pillow>=10.0.0` | Runtime | Converts `mss` pixel data and encodes PNG images. |
 | PySide6 | Example/integration only | Qt application, signals, widgets, pixmaps, and in-memory PNG encoding. |
 
-PySide6 is intentionally not a core dependency because the standalone server can inspect Qt or non-Qt desktop windows without importing Qt.
+PySide6 is intentionally not a core dependency because the standalone server and `AgentProxy` remain Qt-free. Importing `qt_mcp` does not import PySide6; importing or starting `qt_mcp.agent` is the Qt-side operation that triggers the lazy PySide6 imports.
 
 The Windows implementation needs neither `pywin32` nor `pygetwindow`. The required APIs are available through Python's standard-library `ctypes`, keeping the runtime dependency set smaller. Linux window discovery remains external-command based and requires `wmctrl` or `xwininfo`.
 
 ## Tool registration
 
-The standalone server creates a module-level `FastMCP("qt-mcp")` and decorates each wrapper with `@mcp.tool()`. FastMCP derives input schemas from Python type hints and defaults.
+The standalone server creates a module-level `FastMCP("qt-mcp")`, registers 15 tools, and decorates each wrapper with `@mcp.tool()`. FastMCP derives input schemas from Python type hints and defaults. Its proxy tools lazily start `AgentProxy`; the remaining tools do not require an attached app.
 
 The embedded example creates a fresh instance in `build_server(bridge)`. It cannot mutate the standalone instance by registering another `capture_widget`, because FastMCP rejects duplicate tool names. Instead, the example registers all desired wrappers on its own instance and routes widget capture through its bridge.
 
@@ -154,6 +206,8 @@ Domain modules raise explicit exceptions:
 
 - `CaptureError` for window discovery, title matching, invalid capture geometry, screen-grab, and widget-capture failures.
 - `FilesystemError` for invalid paths, missing entries, invalid regular expressions, unsafe directory deletion requests, and I/O failures.
+- `AgentError` for missing attachments, disconnections, proxy startup failures, remote agent errors, and request timeouts.
+- `ProtocolError` for malformed newline-delimited JSON frames or incomplete stream reads.
 
 Each MCP tool wrapper catches its domain exception and raises `ToolError` with the same message:
 

@@ -1,6 +1,6 @@
 """Entry point for the example Qt editor that hosts the MCP server.
 
-Concurrency model:
+Concurrency model (default in-process mode):
   - The **main thread** runs ``QApplication.exec()`` (the Qt event loop). This is
     a Qt hard requirement — QApplication must live on the main thread.
   - A **background thread** runs the MCP stdio server
@@ -8,6 +8,12 @@ Concurrency model:
   - ``capture_widget`` runs on the MCP thread, emits a Qt signal (thread-safe),
     and blocks on a ``threading.Event`` until the Qt GUI thread grabs the widget
     via ``QWidget.grab()`` and fills the result.
+
+Agent mode (``--agent`` or ``QT_EDITOR_AGENT=1``):
+  - The app does NOT start an in-process MCP server. Instead it connects to the
+    standalone ``qt-mcp`` server via a Unix domain socket (``qt_mcp.agent.start_agent``).
+    The standalone server proxies ``capture_widget`` / ``list_capturable_widgets``
+    requests over the socket.
 
 Run directly (an AI client launches this as the MCP server process):
 
@@ -19,10 +25,15 @@ client's stdin/stdout are the MCP transport; Qt diagnostics go to stderr only.
 Run standalone (no MCP, just the window) for a quick visual check:
 
     QT_EDITOR_NO_MCP=1 python -m qt_editor.main
+
+Run in agent mode (standalone qt-mcp server proxies captures):
+
+    QT_EDITOR_AGENT=1 python -m qt_editor.main
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import sys
@@ -74,10 +85,22 @@ def _run_mcp_in_thread(bridge: CaptureBridge) -> threading.Thread:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Qt Editor MCP Demo")
+    parser.add_argument(
+        "--agent",
+        action="store_true",
+        help="Run in agent mode (connect to standalone qt-mcp server instead of in-process MCP)",
+    )
+    args, _ = parser.parse_known_args()
+
+    agent_mode = args.agent or os.environ.get("QT_EDITOR_AGENT", "") not in ("", "0", "false", "False")
     no_mcp = os.environ.get("QT_EDITOR_NO_MCP", "") not in ("", "0", "false", "False")
 
     # Qt attributes for a clean X11 session.
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen" if no_mcp and "DISPLAY" not in os.environ else "xcb")
+    os.environ.setdefault(
+        "QT_QPA_PLATFORM",
+        "offscreen" if (no_mcp and "DISPLAY" not in os.environ) else "xcb",
+    )
 
     app = QApplication(sys.argv)
     app.setApplicationName("qt-editor-mcp-demo")
@@ -86,9 +109,22 @@ def main() -> int:
     window.show()
     logger.info("Editor window shown: %r", WINDOW_TITLE)
 
-    bridge = CaptureBridge(window)
+    if agent_mode:
+        # Agent mode: connect to standalone qt-mcp server.
+        from qt_mcp.agent import start_agent
 
-    if not no_mcp:
+        agent = start_agent(window)
+        logger.info(
+            "qt-editor: agent mode, socket=%s, waiting for qt-mcp server to call capture_widget",
+            agent._socket_path,
+        )
+        print(
+            f"qt-editor: agent mode, socket={agent._socket_path}, "
+            f"waiting for qt-mcp server to call capture_widget",
+            file=sys.stderr,
+        )
+    elif not no_mcp:
+        bridge = CaptureBridge(window)
         _run_mcp_in_thread(bridge)
         logger.info("MCP server launched; connect an AI client to this process's stdio.")
     else:

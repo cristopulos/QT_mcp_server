@@ -2,7 +2,7 @@
 
 This document is the authoritative reference for the tools exposed by `qt-mcp`. Calls are shown as JSON argument objects, as sent in an MCP `tools/call` request. Paths in examples are illustrative and returned paths are resolved absolute paths.
 
-The standalone server (`qt_mcp.server`) exposes 13 tools. The in-process example (`examples.qt_editor.mcp_server.build_server`) exposes the same tools, replaces the `capture_widget` stub with a working implementation, and adds `list_capturable_widgets`.
+The standalone server (`qt_mcp.server`) exposes 15 tools. Its three proxy tools communicate with an attached Qt application over a Unix domain socket. The default in-process example (`examples.qt_editor.mcp_server.build_server`) remains a separate 14-tool server with its own `capture_widget` signature and implementation.
 
 ## Screenshot tools
 
@@ -152,43 +152,120 @@ Example return envelope:
 }
 ```
 
-### `capture_widget` in the standalone server
+### `capture_widget` in the standalone proxy server
 
-Reports that Qt-internal widget capture is unavailable and directs callers to `capture_region`.
+Requests an exact widget capture from the Qt application attached to the standalone server.
 
 ```python
-capture_widget(window_title: str, widget_name: str) -> Image
+capture_widget(widget_name: str) -> Image
 ```
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `window_title` | `str` | Required | Target window title. Retained for the intended widget-capture interface. |
-| `widget_name` | `str` | Required | Intended Qt `objectName`. |
+| `widget_name` | `str` | Required | Qt `objectName` in the attached application; discover names with `list_capturable_widgets`. |
 
-Return: this standalone implementation does not return an image successfully. It raises `ToolError`, represented by MCP as `isError: true`, with fallback guidance.
+Return: MCP image content containing PNG bytes (`mimeType: "image/png"`). The server sends a proxy request to the attached app, decodes its base64 PNG response, and returns an MCP `Image`. Each agent request uses a 10-second timeout; a frozen app or slow GUI thread produces a tool error.
+
+Proxy tools are Linux-only in v1. On another platform, proxy startup fails and the tool reports that `capture_widget` is Linux-only and directs the caller to OS-level `capture_window`.
+
+When no app is attached, the exact tool error is:
+
+```text
+No Qt app is attached. Start a Qt app that calls qt_mcp.agent.start_agent(window).
+```
 
 Example call:
 
 ```json
 {
-  "window_title": "MCP Demo Editor",
   "widget_name": "editor_area"
 }
 ```
 
-Example error return:
+Example return envelope:
 
 ```json
 {
   "content": [
     {
-      "type": "text",
-      "text": "Qt-internal widget capture is not available. The target Qt application has no capture agent loaded. Use capture_region with x/y/width/height (relative to the window via the title argument) instead."
+      "type": "image",
+      "data": "iVBORw0KGgoAAAANSUhEUgAA...",
+      "mimeType": "image/png"
     }
   ],
-  "isError": true
+  "isError": false
 }
 ```
+
+The verified example capture for `editor_area` is a valid 620×548 RGBA PNG of approximately 20 KB. Image dimensions are carried by the private proxy response but are not returned as separate MCP metadata.
+
+### `list_capturable_widgets` in the standalone proxy server
+
+Lists all descendant widgets in the attached application that have a non-empty `objectName()`.
+
+```python
+list_capturable_widgets() -> dict
+```
+
+Parameters: none.
+
+Return shape: `{"widgets": [str], "count": int}`. The agent walks `window.findChildren(QWidget)`, so the result includes application-assigned names and named Qt internal widgets such as scroll-area and dock controls. It does not use the in-process example's explicit allowlist. The example app currently returns 17 names: its 10 intentional names plus named Qt internals.
+
+This tool has the same Linux-only, not-attached, and 10-second request-timeout behavior as the standalone proxy `capture_widget`.
+
+Example call:
+
+```json
+{}
+```
+
+Example return shape (representative excerpt):
+
+```json
+{
+  "widgets": [
+    "toolbar",
+    "editor_area",
+    "qt_scrollarea_viewport",
+    "sidebar",
+    "status_bar",
+    "... 12 additional names ..."
+  ],
+  "count": 17
+}
+```
+
+The placeholder above keeps the example readable. A real response contains 17 actual names, no placeholder entry, and a `count` equal to the array length.
+
+### `attach_status` in the standalone proxy server
+
+Checks whether a Qt application is attached and reports the proxy socket path.
+
+```python
+attach_status() -> dict
+```
+
+Parameters: none.
+
+Return shape: `{"attached": bool, "socket_path": str}`. Calling this tool lazily starts the proxy listener. On Linux, an unattached default instance returns the current user's `/tmp/qt-mcp-<uid>.sock` path:
+
+```json
+{
+  "attached": false,
+  "socket_path": "/tmp/qt-mcp-1000.sock"
+}
+```
+
+After an agent connects:
+
+```json
+{
+  "attached": true,
+  "socket_path": "/tmp/qt-mcp-1000.sock"
+}
+```
+
+Unlike the other proxy tools, `attach_status` catches proxy startup errors and returns `{"attached": false, "socket_path": ""}` rather than raising `ToolError`. This is the current non-Linux result as well.
 
 ### `capture_widget` in the in-process example
 
@@ -237,7 +314,7 @@ Example return envelope:
 
 ### `list_capturable_widgets` in the in-process example
 
-Lists the widget names accepted by the in-process `capture_widget` tool.
+Lists the explicit widget allowlist returned by the example window's `capturable_names()` method. This differs from the standalone proxy tool, which discovers every descendant `QWidget` with a non-empty `objectName()`.
 
 ```python
 list_capturable_widgets() -> dict
@@ -646,4 +723,4 @@ Example return:
 
 ## Errors
 
-Capture and filesystem failures are converted to `ToolError`. MCP clients receive these tool failures with `isError: true` and a textual explanation. Common causes include ambiguous window titles, missing X11 enumeration tools, invalid dimensions or regexes, missing paths, and insufficient filesystem permissions.
+Capture, filesystem, and agent-proxy failures are converted to `ToolError`. MCP clients receive these tool failures with `isError: true` and a textual explanation. Common causes include ambiguous window titles, missing X11 enumeration tools, invalid dimensions or regexes, missing paths, insufficient filesystem permissions, no attached Qt app, an unknown widget name, or a 10-second proxy timeout. Proxy `capture_widget` and `list_capturable_widgets` are Linux-only in v1; use OS-level `capture_window` and `capture_region` on unsupported platforms.

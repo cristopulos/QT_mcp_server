@@ -1,12 +1,16 @@
 """Qt MCP server entrypoint.
 
-Exposes two tool groups over stdio using the Model Context Protocol:
+Exposes three tool groups over stdio using the Model Context Protocol:
 
   1. Qt screenshot tools — list windows, capture a window, capture a screen
      region (optionally relative to a window), and a placeholder for Qt-internal
      widget capture.
   2. Filesystem tools — read, write, list, mkdir, move, delete, file info,
      glob search, and content grep.
+  3. Proxy/agent tools — capture_widget, list_capturable_widgets, and
+     attach_status that communicate with a Qt app via a Unix domain socket
+     (Linux v1).  These require a Qt app that has called
+     ``qt_mcp.agent.start_agent(window)``.
 
 The screenshot tools are Linux/X11 oriented (wmctrl + xwininfo + mss).  They
 fall back to ImageMagick ``import`` if ``mss`` cannot grab the display.
@@ -20,8 +24,11 @@ or via the installed ``qt-mcp`` console script.
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import logging
 import os
+import sys
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP, Image
@@ -30,7 +37,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from . import filesystem as fs
 from . import screenshots as shot
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # stdout is reserved for the MCP JSON-RPC protocol; all diagnostics go to stderr.
 logging.basicConfig(
@@ -126,22 +133,6 @@ def capture_region(
         region["y"],
         region.get("relative_to_window"),
     )
-    return Image(data=result["png"], format="png")
-
-
-@mcp.tool()
-def capture_widget(window_title: str, widget_name: str) -> Image:
-    """Capture a specific Qt widget by its object name.
-
-    NOTE: This requires a Qt-internal capture agent loaded inside the target
-    Qt application, which is not yet wired up in this server. The call will
-    currently return an error explaining how to fall back to capture_region
-    with explicit coordinates.
-    """
-    try:
-        result = shot.capture_widget(window_title, widget_name)
-    except shot.CaptureError as exc:
-        raise ToolError(str(exc)) from exc
     return Image(data=result["png"], format="png")
 
 
@@ -328,6 +319,171 @@ def search_content(
         )
     except fs.FilesystemError as exc:
         raise ToolError(str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Proxy/agent tools (Linux-only, require a Qt app with start_agent)
+# ---------------------------------------------------------------------------
+
+# Module-level singleton guard for the AgentProxy.
+_proxy_instance = None
+_proxy_started = False
+_proxy_loop = None
+_proxy_thread = None
+
+
+def _get_proxy():
+    """Lazily create and start the AgentProxy singleton.
+
+    The proxy runs its own asyncio event loop in a background daemon thread
+    so it does not interfere with the MCP server's event loop.
+
+    Returns the proxy or raises ToolError if the platform is not Linux.
+    """
+    global _proxy_instance, _proxy_started, _proxy_loop, _proxy_thread
+
+    if _proxy_started and _proxy_instance is not None:
+        return _proxy_instance
+
+    if sys.platform != "linux":
+        raise ToolError(
+            "capture_widget (proxy) is Linux-only in v1; "
+            "use the OS-level capture_window tool on other platforms"
+        )
+
+    # Lazy import to avoid requiring asyncio socket support at import time.
+    from . import agent_proxy as ap
+
+    if _proxy_instance is None:
+        _proxy_instance = ap.AgentProxy()
+
+    # Start the proxy in a background thread with its own event loop.
+    import threading as _threading
+
+    _proxy_loop = asyncio.new_event_loop()
+
+    def _run_proxy():
+        asyncio.set_event_loop(_proxy_loop)
+        try:
+            _proxy_loop.run_forever()
+        except Exception:
+            pass
+
+    _proxy_thread = _threading.Thread(target=_run_proxy, name="agent-proxy", daemon=True)
+    _proxy_thread.start()
+
+    # Start the server in the proxy's event loop.
+    try:
+        fut = asyncio.run_coroutine_threadsafe(_proxy_instance.start(), _proxy_loop)
+        fut.result(timeout=5.0)
+    except ap.AgentError as exc:
+        raise ToolError(str(exc)) from exc
+    except TimeoutError:
+        raise ToolError("Timed out starting agent proxy")
+    except OSError as exc:
+        # Socket path in use from a prior crash — remove stale socket and retry.
+        import os as _os
+
+        if _os.path.exists(_proxy_instance.socket_path):
+            _os.unlink(_proxy_instance.socket_path)
+            try:
+                fut = asyncio.run_coroutine_threadsafe(_proxy_instance.start(), _proxy_loop)
+                fut.result(timeout=5.0)
+            except Exception as exc2:
+                raise ToolError(f"Failed to start agent proxy: {exc2}") from exc2
+        else:
+            raise ToolError(f"Failed to start agent proxy: {exc}") from exc
+
+    _proxy_started = True
+    return _proxy_instance
+
+
+def _run_async_in_proxy(coro):
+    """Run a coroutine in the proxy's event loop and return the result."""
+    global _proxy_loop
+    if _proxy_loop is None or not _proxy_loop.is_running():
+        raise ToolError("Agent proxy event loop is not running")
+    fut = asyncio.run_coroutine_threadsafe(coro, _proxy_loop)
+    try:
+        return fut.result(timeout=15.0)
+    except TimeoutError:
+        raise ToolError("Agent proxy request timed out (app may be frozen)")
+
+
+@mcp.tool()
+def capture_widget(widget_name: str) -> Image:
+    """Capture a specific Qt widget by its objectName via the proxy agent.
+
+    Requires a Qt application that has called ``qt_mcp.agent.start_agent(window)``
+    and is connected to this server's Unix domain socket.
+
+    Args:
+        widget_name: The widget's ``objectName``. Use ``list_capturable_widgets``
+            to discover valid names.
+
+    Returns the widget as a PNG image.
+    """
+    proxy = _get_proxy()
+    if not proxy.is_attached:
+        raise ToolError(
+            "No Qt app is attached. Start a Qt app that calls "
+            "qt_mcp.agent.start_agent(window)."
+        )
+
+    try:
+        result = _run_async_in_proxy(proxy.capture_widget(widget_name))
+    except Exception as exc:
+        raise ToolError(str(exc)) from exc
+
+    png_bytes = base64.b64decode(result["png_b64"])
+    logger.info(
+        "Proxied capture_widget(%r) -> %dx%d PNG",
+        widget_name,
+        result["width"],
+        result["height"],
+    )
+    return Image(data=png_bytes, format="png")
+
+
+@mcp.tool()
+def list_capturable_widgets() -> dict:
+    """List the objectNames of widgets in the attached Qt app.
+
+    Requires a Qt application that has called ``qt_mcp.agent.start_agent(window)``
+    and is connected to this server's Unix domain socket.
+
+    Returns: ``{"widgets": ["name1", ...], "count": N}``.
+    """
+    proxy = _get_proxy()
+    if not proxy.is_attached:
+        raise ToolError(
+            "No Qt app is attached. Start a Qt app that calls "
+            "qt_mcp.agent.start_agent(window)."
+        )
+
+    try:
+        names = _run_async_in_proxy(proxy.list_capturable_widgets())
+    except Exception as exc:
+        raise ToolError(str(exc)) from exc
+
+    return {"widgets": names, "count": len(names)}
+
+
+@mcp.tool()
+def attach_status() -> dict:
+    """Check whether a Qt app is currently attached via the proxy agent.
+
+    Always works, no error. Useful for clients to poll.
+
+    Returns: ``{"attached": bool, "socket_path": str}``.
+    """
+    try:
+        proxy = _get_proxy()
+        return {"attached": proxy.is_attached, "socket_path": proxy.socket_path}
+    except ToolError:
+        return {"attached": False, "socket_path": ""}
+    except Exception:
+        return {"attached": False, "socket_path": ""}
 
 
 # ---------------------------------------------------------------------------

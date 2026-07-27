@@ -1,13 +1,14 @@
 # Integrating qt-mcp into a Qt application
 
-There are two ways to expose a Qt application to an MCP client. Choose OS-level capture for a zero-change start, or embed the server for precise named-widget capture.
+There are three ways to expose a Qt application to an MCP client. Use OS-level capture for a zero-change start, proxy/agent mode to keep the application and MCP server as separate processes while gaining precise widget capture, or in-process embedding when the application itself should own the MCP server.
 
 ## Strategy comparison
 
 | Strategy | Application changes | Capture targets | Occluded or off-screen widgets | Coordinate model | Recommended use |
 |---|---|---|---|---|---|
 | OS-level standalone server | None | Visible windows and rectangular screen regions | No; it captures current desktop pixels | Absolute screen coordinates, or offsets relative to a window | Quick inspection and third-party applications |
-| In-process embedded server | Add a bridge and start FastMCP from the app | Windows, regions, and named `QWidget` instances | Yes, through `QWidget.grab()` | Widget identity through `objectName` | Precise integration with an application you control |
+| Proxy/agent | Call `start_agent(window)` and run the standalone server separately | Windows, regions, and discovered named widgets | Yes, for widget capture through `QWidget.grab()` | Widget `objectName` for proxy capture | Reusable standalone server with a normal Qt app lifecycle |
+| In-process embedded server | Add a bridge and start FastMCP from the app | Windows, regions, and explicitly advertised named widgets | Yes, through `QWidget.grab()` | Widget identity through `objectName` | Tight coupling where the Qt app is also the MCP server process |
 
 ## Strategy 1: use the standalone server
 
@@ -21,7 +22,109 @@ The client can call `list_windows`, `capture_window`, and `capture_region`. No s
 
 Configure the client with the absolute virtual-environment Python path as shown in the [README](../README.md#connect-an-mcp-client).
 
-## Strategy 2: embed the server
+## Proxy/agent mode (attach to a running Qt app)
+
+Proxy/agent mode separates the MCP server from the GUI process without giving up `QWidget.grab()` precision. The MCP client launches the normal standalone `qt-mcp` server. On the first proxy-tool call, that server lazily starts a background asyncio loop and binds a Unix domain socket. A Qt application opts in by creating an agent on the GUI thread:
+
+```python
+from qt_mcp.agent import start_agent
+
+agent = start_agent(window)
+```
+
+The application remains a normal Qt app: it owns no FastMCP server and does not reserve its stdin or stdout for MCP. The standalone server remains reusable; stop one attached app and another agent can attach to the same server. In-process mode is more tightly coupled: the application itself is the MCP stdio server and owns both event loops.
+
+### Complete app-side recipe
+
+Install PySide6 in the application's environment and give capturable child widgets non-empty `objectName` values. The proxy agent discovers all descendant `QWidget` instances with non-empty names, including Qt internals; it does not use a separate allowlist.
+
+```python
+from __future__ import annotations
+
+import sys
+
+from PySide6.QtWidgets import QApplication, QLabel, QMainWindow
+from qt_mcp.agent import start_agent
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("My Agent-Enabled Qt App")
+
+        preview = QLabel("Build preview")
+        preview.setObjectName("build_preview")
+        self.setCentralWidget(preview)
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+
+    # Keep the returned Agent alive for as long as the window is running.
+    agent = start_agent(window)
+    window._qt_mcp_agent = agent
+
+    return int(app.exec())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+`start_agent(window, socket_path=None) -> Agent` starts connecting immediately and returns an object whose `stop()` method disconnects cleanly. By default, `qt_mcp.protocol.default_socket_path()` returns `/tmp/qt-mcp-<uid>.sock` on Linux. Override the path on the app side when needed:
+
+```python
+agent = start_agent(window, socket_path="/tmp/my-qt-app-mcp.sock")
+```
+
+The server-side `AgentProxy` must use the same override. The shipped standalone CLI currently constructs its singleton with the default path; a custom path therefore requires constructing/configuring `AgentProxy(socket_path=...)` in your own server integration. For the stock `qt_mcp.server`, use the default path on both sides.
+
+### MCP-client configuration
+
+Configure the MCP client to launch the standalone server, not the Qt app:
+
+```json
+{
+  "mcpServers": {
+    "qt-mcp": {
+      "command": "/absolute/path/to/.venv/bin/python",
+      "args": ["-m", "qt_mcp.server"]
+    }
+  }
+}
+```
+
+Then start the agent-enabled Qt application as a normal process. The standalone server may start before or after the app: the agent reconnects through a non-blocking `QTimer` backoff if the socket is not ready or the server restarts. Use `attach_status()` to poll until it returns `{"attached": true, ...}`, then call `list_capturable_widgets()` and `capture_widget(widget_name="build_preview")`.
+
+The standalone server exposes 15 tools in this mode. Its OS-level and filesystem tools continue working whether or not an agent is attached.
+
+### Run the example in agent mode
+
+From the repository root:
+
+```bash
+PYTHONPATH=examples .venv/bin/python -m qt_editor.main --agent
+```
+
+The equivalent environment-variable form is:
+
+```bash
+QT_EDITOR_AGENT=1 PYTHONPATH=examples .venv/bin/python -m qt_editor.main
+```
+
+In agent mode, the example creates its `QMainWindow`, calls `qt_mcp.agent.start_agent(window)`, and runs only the Qt event loop. It does **not** call `examples.qt_editor.mcp_server.build_server`; the MCP client must launch standalone `qt_mcp.server` separately.
+
+### Threading and transport invariants
+
+- `QWidget.grab()` must execute on the Qt main thread. The agent creates `QLocalSocket` on that thread; its `readyRead` slot therefore reads and dispatches capture requests on the GUI thread.
+- Requests and responses are newline-delimited JSON frames over a Unix domain socket. PNG bytes are base64-encoded in the private agent response and converted back to an MCP `Image` by the server.
+- The standalone server runs its socket proxy in a background daemon thread with its own asyncio event loop, separate from FastMCP's stdio processing.
+- One app may attach to a socket at a time in v1. A second connection is rejected with `Already attached to another app`.
+- Proxy mode is Linux-only in v1. Windows named-pipe support is stubbed with `NotImplementedError` and a TODO; use OS-level `capture_window` or in-process mode on unsupported platforms.
+
+## In-process embedding (the app is the server)
 
 The embedded pattern runs `QApplication` on the main thread and FastMCP in a daemon background thread. A `CaptureBridge` transfers widget-capture work to the GUI thread and returns PNG bytes to the MCP thread.
 
@@ -263,6 +366,8 @@ OS-level capture copies pixels from the desktop compositor or X11 root display. 
 `QWidget.grab()` asks Qt to render that widget into a `QPixmap`. The result is scoped to the widget and does not depend on whether another window covers it or whether all of it is on-screen. This makes object names a stable interface for requests such as “capture the build preview” instead of requiring brittle coordinate calculations.
 
 ## FastMCP duplicate-tool gotcha
+
+This caveat applies to the in-process recipe; proxy/agent mode uses the standalone server's already-registered proxy tools.
 
 A tool name can be registered only once on a `FastMCP` instance. Registering another function under an existing name raises an exception. Therefore, do not import `qt_mcp.server.mcp` and try to replace its `capture_widget` tool.
 
