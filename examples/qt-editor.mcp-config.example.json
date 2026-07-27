@@ -1,0 +1,9 @@
+{
+  "_comment": "Launches the example Qt editor, which ALSO speaks MCP over stdio. The AI client connects to this process's stdio; the editor window appears on screen.",
+  "mcpServers": {
+    "qt-editor": {
+      "command": "/home/cristopulos/VibeCoding Test/Gui Editor MCP/.venv/bin/python",
+      "args": ["-m", "qt_editor.main"]
+    }
+  }
+}

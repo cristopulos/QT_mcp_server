@@ -1,0 +1,9 @@
+{
+  "_comment": "Linux/X11 example below. For Windows, use the venv's Scripts/python.exe path, e.g. \"C:/Users/you/.../Gui Editor MCP/.venv/Scripts/python.exe\"",
+  "mcpServers": {
+    "qt-mcp": {
+      "command": "/home/cristopulos/VibeCoding Test/Gui Editor MCP/.venv/bin/python",
+      "args": ["-m", "qt_mcp.server"]
+    }
+  }
+}
