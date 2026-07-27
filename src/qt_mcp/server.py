@@ -9,8 +9,8 @@ Exposes three tool groups over stdio using the Model Context Protocol:
      glob search, and content grep.
   3. Proxy/agent tools — capture_widget, list_capturable_widgets, and
      attach_status that communicate with a Qt app via a Unix domain socket
-     (Linux v1).  These require a Qt app that has called
-     ``qt_mcp.agent.start_agent(window)``.
+     (Linux/macOS) or named pipe (Windows).  These require a Qt app that has
+     called ``qt_mcp.agent.start_agent(window)``.
 
 The screenshot tools are Linux/X11 oriented (wmctrl + xwininfo + mss).  They
 fall back to ImageMagick ``import`` if ``mss`` cannot grab the display.
@@ -37,7 +37,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from . import filesystem as fs
 from . import screenshots as shot
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # stdout is reserved for the MCP JSON-RPC protocol; all diagnostics go to stderr.
 logging.basicConfig(
@@ -322,7 +322,7 @@ def search_content(
 
 
 # ---------------------------------------------------------------------------
-# Proxy/agent tools (Linux-only, require a Qt app with start_agent)
+# Proxy/agent tools (Linux/macOS/Windows, require a Qt app with start_agent)
 # ---------------------------------------------------------------------------
 
 # Module-level singleton guard for the AgentProxy.
@@ -338,17 +338,17 @@ def _get_proxy():
     The proxy runs its own asyncio event loop in a background daemon thread
     so it does not interfere with the MCP server's event loop.
 
-    Returns the proxy or raises ToolError if the platform is not Linux.
+    Returns the proxy or raises ToolError if the platform is not supported.
     """
     global _proxy_instance, _proxy_started, _proxy_loop, _proxy_thread
 
     if _proxy_started and _proxy_instance is not None:
         return _proxy_instance
 
-    if sys.platform != "linux":
+    if sys.platform not in ("linux", "darwin", "win32"):
         raise ToolError(
-            "capture_widget (proxy) is Linux-only in v1; "
-            "use the OS-level capture_window tool on other platforms"
+            "capture_widget (proxy) is not supported on this platform; "
+            "use the OS-level capture_window tool instead"
         )
 
     # Lazy import to avoid requiring asyncio socket support at import time.
@@ -375,7 +375,7 @@ def _get_proxy():
     # Start the server in the proxy's event loop.
     try:
         fut = asyncio.run_coroutine_threadsafe(_proxy_instance.start(), _proxy_loop)
-        fut.result(timeout=5.0)
+        fut.result(timeout=10.0)
     except ap.AgentError as exc:
         raise ToolError(str(exc)) from exc
     except TimeoutError:
@@ -388,11 +388,18 @@ def _get_proxy():
             _os.unlink(_proxy_instance.socket_path)
             try:
                 fut = asyncio.run_coroutine_threadsafe(_proxy_instance.start(), _proxy_loop)
-                fut.result(timeout=5.0)
+                fut.result(timeout=10.0)
             except Exception as exc2:
                 raise ToolError(f"Failed to start agent proxy: {exc2}") from exc2
         else:
             raise ToolError(f"Failed to start agent proxy: {exc}") from exc
+    except ImportError as exc:
+        # On Windows, PySide6 is required for the QLocalServer backend.
+        if "PySide6" in str(exc):
+            raise ToolError(
+                "Proxy mode on Windows requires PySide6: pip install PySide6"
+            ) from exc
+        raise
 
     _proxy_started = True
     return _proxy_instance

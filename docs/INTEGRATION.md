@@ -24,7 +24,7 @@ Configure the client with the absolute virtual-environment Python path as shown 
 
 ## Proxy/agent mode (attach to a running Qt app)
 
-Proxy/agent mode separates the MCP server from the GUI process without giving up `QWidget.grab()` precision. The MCP client launches the normal standalone `qt-mcp` server. On the first proxy-tool call, that server lazily starts a background asyncio loop and binds a Unix domain socket. A Qt application opts in by creating an agent on the GUI thread:
+Proxy/agent mode separates the MCP server from the GUI process without giving up `QWidget.grab()` precision. The MCP client launches the normal standalone `qt-mcp` server. On the first proxy-tool call, that server lazily starts the platform backend: an asyncio Unix domain socket on Linux/macOS or a Qt `QLocalServer` named pipe on Windows. A Qt application opts in by creating an agent on the GUI thread:
 
 ```python
 from qt_mcp.agent import start_agent
@@ -73,13 +73,17 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-`start_agent(window, socket_path=None) -> Agent` starts connecting immediately and returns an object whose `stop()` method disconnects cleanly. By default, `qt_mcp.protocol.default_socket_path()` returns `/tmp/qt-mcp-<uid>.sock` on Linux. Override the path on the app side when needed:
+`start_agent(window, socket_path=None) -> Agent` starts connecting immediately and returns an object whose `stop()` method disconnects cleanly. By default, `qt_mcp.protocol.default_socket_path()` returns `/tmp/qt-mcp-<uid>.sock` on Linux/macOS and `qt-mcp-<username>` on Windows. Override the path on the app side when needed:
 
 ```python
 agent = start_agent(window, socket_path="/tmp/my-qt-app-mcp.sock")
 ```
 
 The server-side `AgentProxy` must use the same override. The shipped standalone CLI currently constructs its singleton with the default path; a custom path therefore requires constructing/configuring `AgentProxy(socket_path=...)` in your own server integration. For the stock `qt_mcp.server`, use the default path on both sides.
+
+### Windows notes
+
+Proxy mode on Windows requires PySide6 in the standalone server environment: `pip install PySide6`. The default pipe name is `qt-mcp-<username>`; Qt resolves it to `\\.\pipe\qt-mcp-<username>` internally. The app side remains unchanged because `QLocalSocket` is cross-platform. Single-attached-app enforcement and the 10-second request timeout apply as on Linux and macOS.
 
 ### MCP-client configuration
 
@@ -119,10 +123,10 @@ In agent mode, the example creates its `QMainWindow`, calls `qt_mcp.agent.start_
 ### Threading and transport invariants
 
 - `QWidget.grab()` must execute on the Qt main thread. The agent creates `QLocalSocket` on that thread; its `readyRead` slot therefore reads and dispatches capture requests on the GUI thread.
-- Requests and responses are newline-delimited JSON frames over a Unix domain socket. PNG bytes are base64-encoded in the private agent response and converted back to an MCP `Image` by the server.
-- The standalone server runs its socket proxy in a background daemon thread with its own asyncio event loop, separate from FastMCP's stdio processing.
+- Requests and responses are newline-delimited JSON frames over a Unix domain socket on Linux/macOS or a Qt local named pipe on Windows. PNG bytes are base64-encoded in the private agent response and converted back to an MCP `Image` by the server.
+- On Linux/macOS, the standalone server runs its asyncio Unix-socket proxy in a background daemon thread. On Windows, it runs `QLocalServer` in a daemon thread with its own `QEventLoop`; the public proxy API remains awaitable.
 - One app may attach to a socket at a time in v1. A second connection is rejected with `Already attached to another app`.
-- Proxy mode is Linux-only in v1. Windows named-pipe support is stubbed with `NotImplementedError` and a TODO; use OS-level `capture_window` or in-process mode on unsupported platforms.
+- Proxy mode works on Linux, macOS, and Windows. Windows uses a Qt `QLocalServer` named pipe and requires PySide6 on the server (`pip install PySide6`); the app-side `QLocalSocket` agent is unchanged. Use OS-level `capture_window` or in-process mode on other platforms.
 
 ## In-process embedding (the app is the server)
 

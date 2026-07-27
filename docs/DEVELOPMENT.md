@@ -22,7 +22,7 @@ This guide covers local setup, manual protocol checks, tool additions, platform 
 │   └── qt_mcp/
 │       ├── __init__.py       # package version and guarded exports
 │       ├── agent.py          # Qt-side QLocalSocket agent and widget capture
-│       ├── agent_proxy.py    # server-side asyncio Unix socket proxy
+│       ├── agent_proxy.py    # cross-platform Unix socket / Qt pipe proxy
 │       ├── filesystem.py     # filesystem implementation
 │       ├── protocol.py       # newline-delimited JSON frames and socket path
 │       ├── screenshots.py    # platform discovery and PNG capture
@@ -120,7 +120,7 @@ PYTHONPATH=examples .venv/bin/python -m qt_editor.main --agent
 QT_EDITOR_AGENT=1 PYTHONPATH=examples .venv/bin/python -m qt_editor.main
 ```
 
-In another process, launch or drive the standalone server through an MCP client or the stdio driver below. The first call to `attach_status`, `list_capturable_widgets`, or `capture_widget` lazily starts the proxy listener at `/tmp/qt-mcp-<uid>.sock`. Poll `attach_status` until it reports an attachment:
+In another process, launch or drive the standalone server through an MCP client or the stdio driver below. The first call to `attach_status`, `list_capturable_widgets`, or `capture_widget` lazily starts the platform listener: `/tmp/qt-mcp-<uid>.sock` on Linux/macOS or `qt-mcp-<username>` on Windows. Poll `attach_status` until it reports an attachment:
 
 ```json
 {
@@ -158,7 +158,7 @@ Then call `list_capturable_widgets` and `capture_widget`:
 }
 ```
 
-The standalone proxy is Linux-only in v1 and accepts one attached app per socket. Windows named-pipe support is not implemented. The agent's `QLocalSocket` and `readyRead` handler must remain on the Qt main thread so `QWidget.grab()` is safe.
+The standalone proxy works on Linux and macOS through a Unix domain socket, and on Windows through a Qt `QLocalServer` named pipe; the Windows server requires PySide6. One attached app per socket or pipe still applies. The agent's `QLocalSocket` and `readyRead` handler must remain on the Qt main thread so `QWidget.grab()` is safe.
 
 ## Manually test MCP over stdio
 
@@ -331,13 +331,13 @@ sudo apt install wmctrl x11-utils
 
 ### Proxy/agent capture
 
-- Proxy mode is Linux-only in v1; the default socket is `/tmp/qt-mcp-<uid>.sock`.
+- Proxy mode works on Linux and macOS with `/tmp/qt-mcp-<uid>.sock`, and on Windows with `qt-mcp-<username>`, which Qt resolves internally to `\\.\pipe\qt-mcp-<username>`.
 - Verify that `attach_status` changes from false to true when the agent connects and back to false after disconnection.
 - Confirm a second app is rejected while one app is attached to the socket.
 - Start the app before and after the proxy listener to exercise the `QTimer` reconnect path.
 - Confirm `list_capturable_widgets` includes all descendant widgets with non-empty `objectName()` values, including named Qt internals.
 - Block the GUI thread and verify the 10-second proxy operation timeout becomes a controlled tool error.
-- Import `qt_mcp` in an environment without importing PySide6; explicit agent use is the point where PySide6 is needed.
+- Import `qt_mcp` without loading PySide6. PySide6 is required when the app imports the agent and when the standalone proxy tools run on Windows; Linux/macOS server-side proxy operation remains Qt-free.
 
 ### In-process Qt capture
 

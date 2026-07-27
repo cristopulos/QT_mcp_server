@@ -2,7 +2,7 @@
 
 This document is the authoritative reference for the tools exposed by `qt-mcp`. Calls are shown as JSON argument objects, as sent in an MCP `tools/call` request. Paths in examples are illustrative and returned paths are resolved absolute paths.
 
-The standalone server (`qt_mcp.server`) exposes 15 tools. Its three proxy tools communicate with an attached Qt application over a Unix domain socket. The default in-process example (`examples.qt_editor.mcp_server.build_server`) remains a separate 14-tool server with its own `capture_widget` signature and implementation.
+The standalone server (`qt_mcp.server`) exposes 15 tools. Its three proxy tools communicate with an attached Qt application over a Unix domain socket on Linux/macOS or a Qt local named pipe on Windows. The default in-process example (`examples.qt_editor.mcp_server.build_server`) remains a separate 14-tool server with its own `capture_widget` signature and implementation.
 
 ## Screenshot tools
 
@@ -166,7 +166,7 @@ capture_widget(widget_name: str) -> Image
 
 Return: MCP image content containing PNG bytes (`mimeType: "image/png"`). The server sends a proxy request to the attached app, decodes its base64 PNG response, and returns an MCP `Image`. Each agent request uses a 10-second timeout; a frozen app or slow GUI thread produces a tool error.
 
-Proxy tools are Linux-only in v1. On another platform, proxy startup fails and the tool reports that `capture_widget` is Linux-only and directs the caller to OS-level `capture_window`.
+Proxy tools work on Linux, macOS, and Windows. On other platforms, proxy startup fails and directs the caller to OS-level `capture_window`. On Windows, proxy mode requires PySide6 on the server; if it is missing, the tool returns `ToolError("Proxy mode on Windows requires PySide6: pip install PySide6")`.
 
 When no app is attached, the exact tool error is:
 
@@ -211,7 +211,7 @@ Parameters: none.
 
 Return shape: `{"widgets": [str], "count": int}`. The agent walks `window.findChildren(QWidget)`, so the result includes application-assigned names and named Qt internal widgets such as scroll-area and dock controls. It does not use the in-process example's explicit allowlist. The example app currently returns 17 names: its 10 intentional names plus named Qt internals.
 
-This tool has the same Linux-only, not-attached, and 10-second request-timeout behavior as the standalone proxy `capture_widget`.
+This tool has the same cross-platform support, not-attached behavior, Windows PySide6 requirement, and 10-second request timeout as the standalone proxy `capture_widget`.
 
 Example call:
 
@@ -247,7 +247,7 @@ attach_status() -> dict
 
 Parameters: none.
 
-Return shape: `{"attached": bool, "socket_path": str}`. Calling this tool lazily starts the proxy listener. On Linux, an unattached default instance returns the current user's `/tmp/qt-mcp-<uid>.sock` path:
+Return shape: `{"attached": bool, "socket_path": str}`. Calling this tool lazily starts the proxy listener. The default endpoint is `/tmp/qt-mcp-<uid>.sock` on Linux/macOS and `qt-mcp-<username>` on Windows. For example, an unattached Linux instance returns:
 
 ```json
 {
@@ -265,7 +265,7 @@ After an agent connects:
 }
 ```
 
-Unlike the other proxy tools, `attach_status` catches proxy startup errors and returns `{"attached": false, "socket_path": ""}` rather than raising `ToolError`. This is the current non-Linux result as well.
+Unlike the other proxy tools, `attach_status` catches proxy startup errors and returns `{"attached": false, "socket_path": ""}` rather than raising `ToolError`.
 
 ### `capture_widget` in the in-process example
 
@@ -723,4 +723,4 @@ Example return:
 
 ## Errors
 
-Capture, filesystem, and agent-proxy failures are converted to `ToolError`. MCP clients receive these tool failures with `isError: true` and a textual explanation. Common causes include ambiguous window titles, missing X11 enumeration tools, invalid dimensions or regexes, missing paths, insufficient filesystem permissions, no attached Qt app, an unknown widget name, or a 10-second proxy timeout. Proxy `capture_widget` and `list_capturable_widgets` are Linux-only in v1; use OS-level `capture_window` and `capture_region` on unsupported platforms.
+Capture, filesystem, and agent-proxy failures are converted to `ToolError`. MCP clients receive these tool failures with `isError: true` and a textual explanation. Common causes include ambiguous window titles, missing X11 enumeration tools, invalid dimensions or regexes, missing paths, insufficient filesystem permissions, no attached Qt app, an unknown widget name, or a 10-second proxy timeout. Proxy `capture_widget` and `list_capturable_widgets` work on Linux, macOS, and Windows; Windows requires PySide6 on the server. Use OS-level `capture_window` and `capture_region` on other platforms.

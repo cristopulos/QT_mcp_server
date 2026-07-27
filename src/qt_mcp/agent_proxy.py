@@ -1,8 +1,9 @@
 """Server-side agent proxy for the Qt MCP standalone server.
 
-Manages a Unix domain socket (Linux v1) that accepts one Qt app connection.
-Proxies ``capture_widget`` and ``list_capturable_widgets`` requests over the
-socket using newline-delimited JSON frames.
+Manages an IPC endpoint (Unix domain socket on Linux/macOS, named pipe on
+Windows) that accepts one Qt app connection.  Proxies ``capture_widget`` and
+``list_capturable_widgets`` requests over the socket using newline-delimited
+JSON frames.
 
 Usage (internal to ``server.py``)::
 
@@ -18,6 +19,7 @@ import asyncio
 import logging
 import os
 import sys
+import threading
 from typing import Any
 
 from . import protocol
@@ -34,20 +36,109 @@ class AgentError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# AgentProxy
+# AgentProxy — platform-dispatching public class
 # ---------------------------------------------------------------------------
 
 
 class AgentProxy:
-    """Asyncio Unix socket server that proxies widget-capture requests to a
-    single attached Qt application.
+    """IPC server that proxies widget-capture requests to a single attached Qt
+    application.
 
-    Thread-safety: all public async methods must be called from the same asyncio
-    event loop that runs the server.
+    Platform dispatch:
+      - **Linux / macOS**: asyncio Unix domain socket server (no Qt dependency).
+      - **Windows**: ``QLocalServer`` (Qt named-pipe) running in a dedicated
+        thread with its own ``QEventLoop``.  Requires PySide6 at runtime on
+        Windows (lazy import).
+
+    All public methods are ``async`` and identical across platforms.
     """
 
     def __init__(self, socket_path: str | None = None) -> None:
         self._socket_path = socket_path or protocol.default_socket_path()
+
+        if sys.platform in ("linux", "darwin"):
+            self._backend: _AsyncioBackend | _QtLocalServerBackend = _AsyncioBackend(self._socket_path)
+        elif sys.platform == "win32":
+            self._backend = _QtLocalServerBackend(self._socket_path)
+        else:
+            raise NotImplementedError(
+                f"AgentProxy not implemented for platform {sys.platform!r}. "
+                "Supported: linux, darwin, win32."
+            )
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def is_attached(self) -> bool:
+        return self._backend.is_attached
+
+    @property
+    def socket_path(self) -> str:
+        return self._socket_path
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def start(self) -> None:
+        """Start the IPC server and begin listening."""
+        await self._backend.start()
+
+    async def stop(self) -> None:
+        """Stop the server and disconnect the attached app."""
+        await self._backend.stop()
+
+    async def wait_for_attach(self, timeout: float | None = None) -> None:
+        """Wait for a Qt app to connect.
+
+        Raises :class:`asyncio.TimeoutError` on timeout.
+        """
+        await self._backend.wait_for_attach(timeout)
+
+    # ------------------------------------------------------------------
+    # Proxy methods
+    # ------------------------------------------------------------------
+
+    async def capture_widget(self, widget_name: str, timeout: float = 10.0) -> dict[str, Any]:
+        """Request a widget capture from the attached Qt app.
+
+        Returns the result dict with ``png_b64``, ``width``, ``height``, ``format``.
+
+        Raises :class:`AgentError` if no app is attached or the request times out.
+        """
+        if not self.is_attached:
+            raise AgentError(
+                "No Qt app is attached. Start a Qt app that calls "
+                "qt_mcp.agent.start_agent(window)."
+            )
+        return await self._backend.capture_widget(widget_name, timeout)
+
+    async def list_capturable_widgets(self, timeout: float = 10.0) -> list[str]:
+        """Request the list of capturable widget names from the attached Qt app.
+
+        Raises :class:`AgentError` if no app is attached or the request times out.
+        """
+        if not self.is_attached:
+            raise AgentError(
+                "No Qt app is attached. Start a Qt app that calls "
+                "qt_mcp.agent.start_agent(window)."
+            )
+        result = await self._backend.list_capturable_widgets(timeout)
+        return result["widgets"]
+
+
+# ---------------------------------------------------------------------------
+# Linux / macOS backend — asyncio Unix domain socket
+# ---------------------------------------------------------------------------
+
+
+class _AsyncioBackend:
+    """Asyncio Unix domain socket server (Linux / macOS)."""
+
+    def __init__(self, socket_path: str) -> None:
+        self._socket_path = socket_path
         self._server: asyncio.AbstractServer | None = None
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -64,10 +155,6 @@ class AgentProxy:
     def is_attached(self) -> bool:
         return self._writer is not None and not self._closed
 
-    @property
-    def socket_path(self) -> str:
-        return self._socket_path
-
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -78,13 +165,6 @@ class AgentProxy:
         If the socket file already exists (from a prior crash), remove it and
         retry once.
         """
-        if sys.platform != "linux":
-            raise NotImplementedError(
-                f"AgentProxy is Linux-only in v1 (got {sys.platform!r}). "
-                "Windows named-pipe support is planned (TODO)."
-            )
-
-        # Remove stale socket file.
         if os.path.exists(self._socket_path):
             logger.warning("Removing stale socket: %s", self._socket_path)
             os.unlink(self._socket_path)
@@ -97,14 +177,13 @@ class AgentProxy:
         except OSError as exc:
             raise AgentError(f"Failed to start Unix socket server at {self._socket_path}: {exc}") from exc
 
-        logger.info("AgentProxy listening on %s", self._socket_path)
+        logger.info("AgentProxy listening on %s (asyncio Unix socket)", self._socket_path)
 
     async def stop(self) -> None:
         """Stop the server and disconnect the attached app."""
         self._closed = True
         self._attached_event.clear()
 
-        # Cancel all pending futures.
         for fut in self._pending.values():
             if not fut.done():
                 fut.set_exception(AgentError("Qt app disconnected"))
@@ -123,7 +202,6 @@ class AgentProxy:
             await self._server.wait_closed()
             self._server = None
 
-        # Clean up socket file.
         if os.path.exists(self._socket_path):
             try:
                 os.unlink(self._socket_path)
@@ -143,39 +221,18 @@ class AgentProxy:
     # ------------------------------------------------------------------
 
     async def capture_widget(self, widget_name: str, timeout: float = 10.0) -> dict[str, Any]:
-        """Request a widget capture from the attached Qt app.
-
-        Returns the result dict with ``png_b64``, ``width``, ``height``, ``format``.
-
-        Raises :class:`AgentError` if no app is attached or the request times out.
-        """
-        if not self.is_attached:
-            raise AgentError(
-                "No Qt app is attached. Start a Qt app that calls "
-                "qt_mcp.agent.start_agent(window)."
-            )
         return await self._send_request(
             protocol.METHOD_CAPTURE_WIDGET,
             {"widget_name": widget_name},
             timeout=timeout,
         )
 
-    async def list_capturable_widgets(self, timeout: float = 10.0) -> list[str]:
-        """Request the list of capturable widget names from the attached Qt app.
-
-        Raises :class:`AgentError` if no app is attached or the request times out.
-        """
-        if not self.is_attached:
-            raise AgentError(
-                "No Qt app is attached. Start a Qt app that calls "
-                "qt_mcp.agent.start_agent(window)."
-            )
-        result = await self._send_request(
+    async def list_capturable_widgets(self, timeout: float = 10.0) -> dict[str, Any]:
+        return await self._send_request(
             protocol.METHOD_LIST_WIDGETS,
             {},
             timeout=timeout,
         )
-        return result["widgets"]
 
     # ------------------------------------------------------------------
     # Internal
@@ -187,7 +244,6 @@ class AgentProxy:
         params: dict[str, Any],
         timeout: float = 10.0,
     ) -> Any:
-        """Send a request and wait for the matching response."""
         req_id = self._next_id
         self._next_id += 1
 
@@ -220,10 +276,6 @@ class AgentProxy:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        """Handle a new connection from a Qt app.
-
-        Enforces single-attached-app: if already connected, reject and close.
-        """
         peername = writer.get_extra_info("peername")
         logger.info("New connection from %s", peername)
 
@@ -238,7 +290,6 @@ class AgentProxy:
             writer.close()
             return
 
-        # Accept the connection.
         self._reader = reader
         self._writer = writer
         self._attached_event.set()
@@ -275,7 +326,6 @@ class AgentProxy:
             self._writer = None
             self._attached_event.clear()
 
-            # Fail all pending futures.
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(AgentError("Qt app disconnected"))
@@ -285,3 +335,288 @@ class AgentProxy:
                 writer.close()
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Windows backend — QLocalServer in a dedicated thread
+# ---------------------------------------------------------------------------
+
+
+class _QtLocalServerBackend:
+    """QLocalServer (Qt named-pipe) backend for Windows.
+
+    Runs a ``QEventLoop`` in a dedicated daemon thread.  The MCP tool thread
+    blocks on a ``concurrent.futures.Future`` that the Qt event-loop thread
+    resolves when a response frame arrives.
+    """
+
+    def __init__(self, socket_path: str) -> None:
+        self._socket_path = socket_path
+        self._thread: threading.Thread | None = None
+        self._loop: Any = None  # QEventLoop
+        self._app: Any = None  # QApplication
+        self._server: Any = None  # QLocalServer
+        self._socket: Any = None  # QLocalSocket (connected client)
+        self._attached_event = threading.Event()
+        self._pending: dict[int, Any] = {}  # id -> concurrent.futures.Future
+        self._next_id = 1
+        self._closed = False
+        self._lock = threading.Lock()
+        self._recv_buffer = b""
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def is_attached(self) -> bool:
+        return self._socket is not None and not self._closed
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def start(self) -> None:
+        """Start the QLocalServer in a background thread."""
+        from concurrent.futures import Future
+
+        self._closed = False
+        self._attached_event.clear()
+
+        start_fut: Future = Future()
+
+        def _run() -> None:
+            # Lazy import of PySide6 — only on Windows, only when proxy starts.
+            from PySide6.QtCore import QEventLoop
+            from PySide6.QtNetwork import QLocalServer, QLocalSocket
+            from PySide6.QtWidgets import QApplication
+
+            app = QApplication.instance()
+            if app is None:
+                app = QApplication([])
+            self._app = app
+
+            loop = QEventLoop()
+            self._loop = loop
+
+            server = QLocalServer()
+            self._server = server
+
+            # Remove stale pipe before listening.
+            QLocalServer.removeServer(self._socket_path)
+
+            def on_new_connection() -> None:
+                if not server.hasPendingConnections():
+                    return
+                sock = server.nextPendingConnection()
+                if sock is None:
+                    return
+
+                if self.is_attached:
+                    logger.warning("Rejecting second connection")
+                    reject = protocol.encode_response(0, False, error="Already attached to another app")
+                    sock.write(reject)
+                    sock.flush()
+                    sock.disconnectFromServer()
+                    return
+
+                self._socket = sock
+                self._recv_buffer = b""
+                sock.readyRead.connect(self._on_ready_read)
+                sock.disconnected.connect(self._on_disconnected)
+                self._attached_event.set()
+                logger.info("Qt app attached on %s", self._socket_path)
+
+            server.newConnection.connect(on_new_connection)
+
+            ok = server.listen(self._socket_path)
+            if not ok:
+                start_fut.set_exception(
+                    AgentError(
+                        f"QLocalServer failed to listen on {self._socket_path}: "
+                        f"{server.errorString()}"
+                    )
+                )
+                return
+
+            logger.info("AgentProxy listening on %s (QLocalServer)", self._socket_path)
+            start_fut.set_result(None)
+
+            loop.exec()
+
+            # Cleanup after loop exits.
+            if self._socket is not None:
+                try:
+                    self._socket.disconnectFromServer()
+                except Exception:
+                    pass
+                self._socket = None
+            if self._server is not None:
+                self._server.close()
+                self._server = None
+            QLocalServer.removeServer(self._socket_path)
+
+        self._thread = threading.Thread(target=_run, name="qt-proxy", daemon=True)
+        self._thread.start()
+
+        try:
+            start_fut.result(timeout=10.0)
+        except TimeoutError:
+            raise AgentError("Timed out starting QLocalServer backend")
+
+    async def stop(self) -> None:
+        """Stop the server and disconnect the attached app."""
+        self._closed = True
+        self._attached_event.clear()
+
+        with self._lock:
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.set_exception(AgentError("Qt app disconnected"))
+            self._pending.clear()
+
+        if self._loop is not None:
+            from PySide6.QtCore import QMetaObject, Qt
+
+            QMetaObject.invokeMethod(
+                self._loop,
+                "quit",
+                Qt.ConnectionType.QueuedConnection,
+            )
+
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+
+        self._socket = None
+        self._server = None
+        self._loop = None
+        self._app = None
+
+    async def wait_for_attach(self, timeout: float | None = None) -> None:
+        """Wait for a Qt app to connect.
+
+        Raises :class:`asyncio.TimeoutError` on timeout.
+        """
+        import time
+
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        while not self._attached_event.is_set():
+            if deadline is not None and time.monotonic() >= deadline:
+                raise asyncio.TimeoutError()
+            await asyncio.sleep(0.1)
+
+    # ------------------------------------------------------------------
+    # Proxy methods
+    # ------------------------------------------------------------------
+
+    async def capture_widget(self, widget_name: str, timeout: float = 10.0) -> dict[str, Any]:
+        return await self._send_request(
+            protocol.METHOD_CAPTURE_WIDGET,
+            {"widget_name": widget_name},
+            timeout=timeout,
+        )
+
+    async def list_capturable_widgets(self, timeout: float = 10.0) -> dict[str, Any]:
+        return await self._send_request(
+            protocol.METHOD_LIST_WIDGETS,
+            {},
+            timeout=timeout,
+        )
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    async def _send_request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        timeout: float = 10.0,
+    ) -> Any:
+        from concurrent.futures import Future
+
+        req_id = self._next_id
+        self._next_id += 1
+
+        fut: Future = Future()
+        with self._lock:
+            self._pending[req_id] = fut
+
+        try:
+            frame = protocol.encode_request(req_id, method, params)
+
+            # Write to the Qt socket. QLocalSocket.write() is reentrant but not
+            # thread-safe. We protect with the lock and write directly since
+            # pipe writes are safe in practice.
+            with self._lock:
+                if self._socket is not None:
+                    self._socket.write(frame)
+                    self._socket.flush()
+
+            # Wait for the response with timeout, offloading to a thread.
+            loop = asyncio.get_running_loop()
+            try:
+                response = await loop.run_in_executor(None, lambda: fut.result(timeout=timeout))
+            except TimeoutError:
+                raise AgentError(
+                    f"{method} timed out after {timeout}s (app may be frozen)"
+                )
+
+            if not response.get("ok", False):
+                raise AgentError(response.get("error", "Unknown error from app"))
+            return response.get("result")
+        finally:
+            with self._lock:
+                self._pending.pop(req_id, None)
+
+    def _on_ready_read(self) -> None:
+        """Slot connected to ``QLocalSocket.readyRead``.
+
+        Runs on the Qt event loop thread.  Reads available data, accumulates
+        in a buffer, extracts complete newline-delimited frames, and resolves
+        pending futures.
+        """
+        sock = self._socket
+        if sock is None:
+            return
+
+        raw = bytes(sock.readAll())
+        self._recv_buffer += raw
+
+        while True:
+            idx = self._recv_buffer.find(b"\n")
+            if idx == -1:
+                break
+            frame_data = self._recv_buffer[:idx]
+            self._recv_buffer = self._recv_buffer[idx + 1 :]
+
+            if not frame_data.strip():
+                continue
+
+            try:
+                response = protocol.decode_response(frame_data)
+            except protocol.ProtocolError as exc:
+                logger.warning("Malformed frame from app: %s", exc)
+                continue
+
+            req_id: int | None = response.get("id")
+            with self._lock:
+                fut = self._pending.get(req_id) if req_id is not None else None
+            if fut is not None and not fut.done():
+                fut.set_result(response)
+            else:
+                logger.debug("Received response for unknown/finished id %s", req_id)
+
+    def _on_disconnected(self) -> None:
+        """Handle client disconnection."""
+        logger.info("Qt app detached")
+        self._socket = None
+        self._recv_buffer = b""
+        self._attached_event.clear()
+
+        with self._lock:
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.set_exception(AgentError("Qt app disconnected"))
+            self._pending.clear()

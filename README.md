@@ -2,7 +2,7 @@
 
 An MCP (Model Context Protocol) server for inspecting Qt applications through screenshots and performing basic filesystem operations.
 
-`qt-mcp` 0.2.0 lets an MCP-capable AI client see a Qt or desktop application, inspect complete windows, selected regions, or named widgets, and read or update nearby project files. It uses the MCP Python SDK v1.28.1 high-level `FastMCP` API and stdio transport. The architecture is inspired by [VibeUE](https://github.com/kevinpbuckley/VibeUE), adapted for Qt and general desktop windows.
+`qt-mcp` 0.3.0 lets an MCP-capable AI client see a Qt or desktop application, inspect complete windows, selected regions, or named widgets, and read or update nearby project files. It uses the MCP Python SDK v1.28.1 high-level `FastMCP` API and stdio transport. The architecture is inspired by [VibeUE](https://github.com/kevinpbuckley/VibeUE), adapted for Qt and general desktop windows.
 
 ## Features at a glance
 
@@ -77,7 +77,7 @@ from qt_mcp.agent import start_agent
 agent = start_agent(window)
 ```
 
-The MCP client launches standalone `qt_mcp.server`, which binds `/tmp/qt-mcp-<uid>.sock` on Linux and proxies `capture_widget(widget_name)` to the attached app's GUI thread. See the complete [proxy/agent integration recipe](docs/INTEGRATION.md#proxyagent-mode-attach-to-a-running-qt-app).
+The MCP client launches standalone `qt_mcp.server`, which listens on `/tmp/qt-mcp-<uid>.sock` on Linux/macOS or the `qt-mcp-<username>` named pipe on Windows, then proxies `capture_widget(widget_name)` to the attached app's GUI thread. See the complete [proxy/agent integration recipe](docs/INTEGRATION.md#proxyagent-mode-attach-to-a-running-qt-app).
 
 ## Connect an MCP client
 
@@ -121,7 +121,7 @@ Forward slashes avoid JSON backslash escaping on Windows. A Linux template is al
 | Standalone proxy + Qt agent | The same standalone server proxies to one attached Qt app | 15 | Real `QWidget.grab()` through `capture_widget(widget_name)` | Reusable server plus a normal independently launched Qt app |
 | In-process example, `examples/qt_editor/` | Qt app embeds FastMCP in a background thread | 14 | Real `QWidget.grab()` through its own tool signature | Tight coupling where the app itself is the MCP server |
 
-The standalone server always advertises 15 tools; its three proxy tools start the Linux socket listener lazily and require an attached agent for widget operations. OS-level mode requires no target-app changes. Proxy and in-process modes both capture occluded or off-screen widgets precisely. Follow the [integration guide](docs/INTEGRATION.md), and see the implementations in [`src/qt_mcp/agent.py`](src/qt_mcp/agent.py) and [`examples/qt_editor/`](examples/qt_editor/).
+The standalone server always advertises 15 tools; its three proxy tools start the platform transport lazily and require an attached agent for widget operations. OS-level mode requires no target-app changes. Proxy and in-process modes both capture occluded or off-screen widgets precisely. Follow the [integration guide](docs/INTEGRATION.md), and see the implementations in [`src/qt_mcp/agent.py`](src/qt_mcp/agent.py) and [`examples/qt_editor/`](examples/qt_editor/).
 
 ## Example workflow
 
@@ -181,7 +181,6 @@ This screenshot-to-inspection-to-filesystem loop lets the client correlate the r
 
 ## Roadmap
 
-- Add Windows named-pipe support for proxy/agent mode.
 - Add Wayland OS-level capture through platform-appropriate tools or portals.
 - Add macOS window discovery and capture.
 - Generalize `CaptureBridge` into a reusable package component.

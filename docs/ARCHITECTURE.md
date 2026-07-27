@@ -15,9 +15,11 @@ AI client <--- stdio JSON-RPC ---> qt_mcp.server
 Proxy/agent:
 AI client <--- stdio JSON-RPC ---> qt_mcp.server
                                     ├── filesystem and OS capture tools
-                                    └── background asyncio AgentProxy
+                                    └── platform AgentProxy backend
                                                    |
-                                      Unix domain socket, NDJSON
+                                      NDJSON local transport:
+                                      Unix socket (Linux/macOS)
+                                      QLocalServer pipe (Windows)
                                                    |
                                     Qt app Agent (QLocalSocket)
                                     └── main-thread QWidget.grab()
@@ -50,8 +52,8 @@ src/qt_mcp/
 | `server.py` | Creates the standalone `FastMCP` instance, registers 15 tool wrappers, converts domain errors to `ToolError`, starts stdio transport, and lazily owns the proxy singleton and background loop. |
 | `screenshots.py` | Dispatches OS window discovery, matches titles, captures pixel rectangles, encodes PNG data, and defines `CaptureError`. |
 | `filesystem.py` | Resolves paths and implements text reads/writes, directory operations, metadata, glob search, regex content search, and `FilesystemError`. |
-| `protocol.py` | Defines the newline-delimited JSON request/response format, Linux default socket path, `ProtocolError`, and synchronous/asynchronous frame helpers. |
-| `agent_proxy.py` | Implements the server-side asyncio Unix socket `AgentProxy`, single-app enforcement, request correlation, attachment state, timeouts, and `AgentError`. |
+| `protocol.py` | Defines the newline-delimited JSON request/response format, platform-specific default socket or pipe name, `ProtocolError`, and synchronous/asynchronous frame helpers. |
+| `agent_proxy.py` | Implements the cross-platform server-side `AgentProxy`: `_AsyncioBackend` uses asyncio Unix sockets on Linux/macOS, while `_QtLocalServerBackend` lazily imports PySide6 and runs `QLocalServer` in a daemon-thread `QEventLoop` on Windows. Both enforce one app, correlate requests, track attachment state, and apply timeouts. |
 | `agent.py` | Implements the Qt-side `Agent` with lazy PySide6 imports, `QLocalSocket` request handling, GUI-thread widget capture, and `QTimer` reconnect behavior. |
 
 The server layer is deliberately thin. Platform and filesystem behavior lives in ordinary Python functions, making those functions reusable by the embedded example without importing the standalone `FastMCP` instance.
@@ -136,11 +138,11 @@ MCP client calls capture_widget             |
     `-- return FastMCP Image to client
 ```
 
-`server.py` creates the `AgentProxy` singleton lazily on the first proxy-tool call. The proxy runs in a daemon thread with its own asyncio event loop and uses `asyncio.start_unix_server`. It accepts one attached application at a time, correlates request IDs with pending futures, and applies a 10-second operation timeout.
+`server.py` creates the `AgentProxy` singleton lazily on the first proxy-tool call. Linux and macOS use `_AsyncioBackend` with an asyncio Unix domain socket. Windows uses `_QtLocalServerBackend`, which lazily imports PySide6 and runs `QLocalServer` in a daemon thread with its own `QEventLoop`; `concurrent.futures.Future` and `loop.run_in_executor` keep the public proxy methods awaitable without blocking asyncio. Both backends accept one attached application at a time, correlate request IDs with pending futures, and apply a 10-second operation timeout.
 
 The Qt-side `Agent` creates `QLocalSocket` on the GUI thread. Because `readyRead` is delivered to the socket's owning thread, request dispatch and `QWidget.grab()` both run on the Qt main thread. Capture responses contain base64 PNG data plus width, height, and format fields; the MCP layer converts the PNG back into `Image` content.
 
-If the server is unavailable or disconnects, the agent uses single-shot `QTimer` callbacks for non-blocking reconnect attempts with backoff, resetting the retry state after a successful connection. The default socket is `/tmp/qt-mcp-<uid>.sock` on Linux. Windows named-pipe support is not implemented in v1.
+If the server is unavailable or disconnects, the agent uses single-shot `QTimer` callbacks for non-blocking reconnect attempts with backoff, resetting the retry state after a successful connection. The default endpoint is `/tmp/qt-mcp-<uid>.sock` on Linux/macOS and `qt-mcp-<username>` on Windows, where Qt resolves the short name to `\\.\pipe\qt-mcp-<username>` internally.
 
 ## In-process concurrency model
 
@@ -188,9 +190,9 @@ The standalone process cannot call `QWidget.grab()` directly because it has no a
 | `mcp>=1.28.1,<2` | Runtime | FastMCP server, stdio transport, `Image`, and `ToolError`. |
 | `mss>=9.0.0` | Runtime | Cross-platform physical-pixel screen grabs. |
 | `pillow>=10.0.0` | Runtime | Converts `mss` pixel data and encodes PNG images. |
-| PySide6 | Example/integration only | Qt application, signals, widgets, pixmaps, and in-memory PNG encoding. |
+| PySide6 | Example/integration; Windows proxy server | Qt application, signals, widgets, pixmaps, in-memory PNG encoding, and the Windows `QLocalServer` backend. |
 
-PySide6 is intentionally not a core dependency because the standalone server and `AgentProxy` remain Qt-free. Importing `qt_mcp` does not import PySide6; importing or starting `qt_mcp.agent` is the Qt-side operation that triggers the lazy PySide6 imports.
+PySide6 is intentionally not a core dependency because filesystem and OS-level capture remain Qt-free on every platform, and Linux/macOS use the Qt-free proxy backend. Importing `qt_mcp` does not import PySide6. The Qt app imports `qt_mcp.agent`, while the standalone server imports PySide6 lazily only when proxy tools start the Windows backend.
 
 The Windows implementation needs neither `pywin32` nor `pygetwindow`. The required APIs are available through Python's standard-library `ctypes`, keeping the runtime dependency set smaller. Linux window discovery remains external-command based and requires `wmctrl` or `xwininfo`.
 

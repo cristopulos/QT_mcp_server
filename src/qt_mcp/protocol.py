@@ -1,7 +1,7 @@
 """Shared request/response protocol for the Qt MCP agent proxy.
 
-Newline-delimited JSON over a Unix domain socket (Linux v1) or named pipe
-(Windows, TODO).
+Newline-delimited JSON over a Unix domain socket (Linux/macOS) or named pipe
+(Windows).
 
 Protocol:
   Request:  {"id": <int>, "method": "capture_widget"|"list_capturable_widgets", "params": {...}}
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import getpass
 import json
 import os
 import sys
@@ -45,17 +46,28 @@ class ProtocolError(Exception):
 
 
 def default_socket_path() -> str:
-    """Return the default Unix domain socket path for the current user.
+    """Return the default IPC endpoint path for the current user.
 
-    Linux: ``/tmp/qt-mcp-<uid>.sock``
-    Non-Linux: raises :class:`NotImplementedError` (Windows named-pipe TODO).
+    Linux/macOS: ``/tmp/qt-mcp-<uid>.sock`` (Unix domain socket).
+    Windows: ``qt-mcp-<username>`` (named pipe — ``QLocalServer``/``QLocalSocket``
+    resolve this to ``\\\\.\\pipe\\qt-mcp-<username>`` internally).
     """
     if sys.platform == "linux":
         return os.path.join(tempfile.gettempdir(), f"qt-mcp-{os.getuid()}.sock")
-    # TODO: Windows named-pipe support.
+    if sys.platform == "darwin":
+        return os.path.join(tempfile.gettempdir(), f"qt-mcp-{os.getuid()}.sock")
+    if sys.platform == "win32":
+        try:
+            user = getpass.getuser()
+        except Exception:
+            user = str(os.getpid())
+        # QLocalServer/QLocalSocket on Windows use the \\.\pipe\<name> convention
+        # internally; just the short name is sufficient for both listen() and
+        # connectToServer().
+        return f"qt-mcp-{user}"
     raise NotImplementedError(
-        f"Unix domain sockets are not supported on {sys.platform!r}. "
-        "Windows named-pipe support is planned (TODO)."
+        f"IPC transport not implemented for platform {sys.platform!r}. "
+        "Supported: linux, darwin, win32."
     )
 
 
